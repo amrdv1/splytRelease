@@ -6,6 +6,7 @@ import aiosqlite
 import aiohttp
 import base64
 import urllib.parse
+import re
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
@@ -57,6 +58,21 @@ async def init_db():
         """)
         await db.commit()
 
+# ---------------- HELPERS ----------------
+def clean_text(text):
+    return re.sub(r"[^\w\s]", "", text)
+
+def build_youtube_search_link(artist, track):
+    query = f"{artist} {track}"
+    return f"https://www.youtube.com/results?search_query={urllib.parse.quote(query)}"
+
+def build_smart_block(link):
+    return (
+        "\n\n"
+        "слухати 👇\n"
+        f"<a href=\"{link}\">link</a>"
+    )
+
 # ---------------- SPOTIFY ----------------
 async def get_spotify_token():
     auth = base64.b64encode(
@@ -88,14 +104,18 @@ async def get_spotify_link_from_isrc(isrc):
                     return items[0]["external_urls"]["spotify"]
 
     except Exception as e:
-        logging.error(f"Spotify error: {e}")
+        logging.error(f"ISRC Spotify error: {e}")
 
     return None
 
 async def search_spotify_by_text(artist, track):
     try:
         token = await get_spotify_token()
-        query = f"{artist} {track}"
+
+        artist_clean = clean_text(artist)
+        track_clean = clean_text(track)
+
+        query = f"track:{track_clean} artist:{artist_clean}"
 
         async with aiohttp.ClientSession() as session:
             async with session.get(
@@ -105,15 +125,10 @@ async def search_spotify_by_text(artist, track):
                 data = await resp.json()
 
                 items = data.get("tracks", {}).get("items", [])
-                if items:
-                    item = items[0]
+                print("SPOTIFY SEARCH:", items)
 
-                    return {
-                        "artist": item["artists"][0]["name"],
-                        "track": item["name"],
-                        "image": item["album"]["images"][0]["url"],
-                        "spotify": item["external_urls"]["spotify"]
-                    }
+                if items:
+                    return items[0]["external_urls"]["spotify"]
 
     except Exception as e:
         logging.error(f"Spotify search error: {e}")
@@ -121,12 +136,9 @@ async def search_spotify_by_text(artist, track):
     return None
 
 # ---------------- ODESLI ----------------
-async def create_smart_link(links):
+async def create_smart_link(link):
     try:
-        if not links:
-            return None
-
-        url = f"https://api.song.link/v1-alpha.1/links?url={links[0]}"
+        url = f"https://api.song.link/v1-alpha.1/links?url={link}"
 
         async with aiohttp.ClientSession() as session:
             async with session.get(url) as resp:
@@ -135,25 +147,8 @@ async def create_smart_link(links):
 
     except Exception as e:
         logging.error(f"Odesli error: {e}")
-        return None
 
-async def create_smart_link_from_isrc(isrc):
-    spotify_link = await get_spotify_link_from_isrc(isrc)
-    if spotify_link:
-        return await create_smart_link([spotify_link])
     return None
-
-# ---------------- FALLBACK ----------------
-def build_youtube_search_link(artist, track):
-    query = f"{artist} {track}"
-    return f"https://www.youtube.com/results?search_query={urllib.parse.quote(query)}"
-
-def build_smart_block(link):
-    return (
-        "\n\n"
-        "слухати 👇\n"
-        f"<a href=\"{link}\">link</a>"
-    )
 
 # ---------------- STATES ----------------
 class Form(StatesGroup):
@@ -227,18 +222,6 @@ async def image_step(message: Message, state: FSMContext):
         await state.update_data(image_file_id=photo)
 
         data = await state.get_data()
-
-        # 🔥 Spotify metadata fallback
-        if not data.get("isrc"):
-            spotify_data = await search_spotify_by_text(
-                data.get("artist"),
-                data.get("track_name")
-            )
-
-            if spotify_data:
-                data["artist"] = spotify_data["artist"]
-                data["track_name"] = spotify_data["track"]
-
         text = await generate_full_text(data)
 
         async with aiosqlite.connect(DB_PATH) as db:
@@ -310,16 +293,6 @@ async def generate_full_text(data):
     except:
         return "Норм трек\n\n❤️ — качає\n💔 — сиро"
 
-# ---------------- LINKS ----------------
-def build_links():
-    return (
-        "\n\n"
-        "<a href='https://t.me/Splyt_ch'>splyT</a> | "
-        "<a href='https://t.me/splyt_chat'>Чат</a> | "
-        "<a href='https://discord.gg/pdu4SSFwPN'>discord</a>\n"
-        "👉 <a href='https://t.me/Splyt_ch'><b>ПІДПИСАТИСЯ</b></a>"
-    )
-
 # ---------------- APPROVE ----------------
 def get_admin_kb(track_id):
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -381,14 +354,17 @@ async def post(callback):
         smart_link = None
 
         if links:
-            smart_link = await create_smart_link(links)
+            smart_link = await create_smart_link(links[0])
+
         elif isrc:
-            smart_link = await create_smart_link_from_isrc(isrc)
+            spotify = await get_spotify_link_from_isrc(isrc)
+            if spotify:
+                smart_link = await create_smart_link(spotify)
 
         if not smart_link:
-            spotify_data = await search_spotify_by_text(artist, track)
-            if spotify_data:
-                smart_link = await create_smart_link([spotify_data["spotify"]])
+            spotify = await search_spotify_by_text(artist, track)
+            if spotify:
+                smart_link = await create_smart_link(spotify)
 
         if not smart_link:
             smart_link = build_youtube_search_link(artist, track)
@@ -397,7 +373,6 @@ async def post(callback):
             f"🎵 {artist} - {track}\n\n"
             f"{text}"
             f"{build_smart_block(smart_link)}"
-            f"{build_links()}"
         )
 
         await bot.send_photo(
