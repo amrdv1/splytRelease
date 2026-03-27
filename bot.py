@@ -2,6 +2,7 @@ import asyncio
 import os
 import json
 import logging
+import random
 import aiosqlite
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
@@ -17,18 +18,15 @@ logging.basicConfig(level=logging.INFO)
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x]
+CHANNEL_ID = int(os.getenv("CHANNEL_ID"))
 
-if not BOT_TOKEN:
-    raise ValueError("❌ BOT_TOKEN not set")
-
-# ---------------- INIT ----------------
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-# ---------------- DB ----------------
 DB_PATH = "tracks.db"
 
+# ---------------- DB ----------------
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("""
@@ -81,33 +79,29 @@ async def track_step(message: Message, state: FSMContext):
 async def isrc_step(message: Message, state: FSMContext):
     data = await state.get_data()
 
-    isrc = message.text.strip()
-    track = data.get("track_name", "").strip()
-
-    if isrc == "-" and track == "-":
-        await message.answer("❌ Потрібен ISRC або назва треку")
+    if message.text.strip() == "-" and data.get("track_name") == "-":
+        await message.answer("❌ Потрібен ISRC або назва")
         return
 
-    await state.update_data(isrc=None if isrc == "-" else isrc)
+    await state.update_data(isrc=None if message.text == "-" else message.text.strip())
     await message.answer("Жанр:")
     await state.set_state(Form.genre)
 
 @dp.message(Form.genre)
 async def genre_step(message: Message, state: FSMContext):
     await state.update_data(genre=message.text.strip())
-    await message.answer("Настрій / вайб (або -):")
+    await message.answer("Настрій (або -):")
     await state.set_state(Form.mood)
 
 @dp.message(Form.mood)
 async def mood_step(message: Message, state: FSMContext):
-    await state.update_data(mood=None if message.text.strip() == "-" else message.text.strip())
+    await state.update_data(mood=None if message.text == "-" else message.text.strip())
     await message.answer("Посилання (або -):")
     await state.set_state(Form.links)
 
 @dp.message(Form.links)
 async def links_step(message: Message, state: FSMContext):
-    text = message.text.strip()
-    links = [] if text == "-" else [text]
+    links = [] if message.text.strip() == "-" else [message.text.strip()]
     await state.update_data(links=json.dumps(links))
     await message.answer("Завантаж обкладинку:")
     await state.set_state(Form.image)
@@ -120,10 +114,18 @@ async def image_step(message: Message, state: FSMContext):
 
         data = await state.get_data()
 
-        # ---------------- AI ----------------
-        text = await generate_text(data)
+        # ---------- LINKS ----------
+        links = json.loads(data.get("links"))
 
-        # ---------------- SAVE ----------------
+        if not links and data.get("isrc"):
+            smart = await get_feature_link(data.get("isrc"))
+            if smart:
+                links = [smart]
+
+        # ---------- AI ----------
+        hook = await generate_hook(data)
+
+        # ---------- SAVE ----------
         async with aiosqlite.connect(DB_PATH) as db:
             cursor = await db.execute("""
             INSERT INTO tracks (artist, track_name, isrc, genre, mood, links, image_file_id, description, status)
@@ -134,15 +136,14 @@ async def image_step(message: Message, state: FSMContext):
                 data.get("isrc"),
                 data.get("genre"),
                 data.get("mood"),
-                data.get("links"),
+                json.dumps(links),
                 photo,
-                text,
+                hook,
                 "pending"
             ))
             await db.commit()
             track_id = cursor.lastrowid
 
-        # ---------------- ADMIN BUTTONS ----------------
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [
                 InlineKeyboardButton(text="✅ Approve", callback_data=f"approve_{track_id}"),
@@ -150,69 +151,103 @@ async def image_step(message: Message, state: FSMContext):
             ]
         ])
 
-        # ---------------- SEND TO ADMINS ----------------
         for admin in ADMIN_IDS:
-            try:
-                await bot.send_photo(
-                    admin,
-                    photo=photo,
-                    caption=f"🎵 {data.get('artist')} - {data.get('track_name')}\n\n{text}",
-                    reply_markup=kb
-                )
-            except Exception as e:
-                logging.error(f"Admin send error: {e}")
+            await bot.send_photo(
+                admin,
+                photo=photo,
+                caption=f"🎵 {data.get('artist')} - {data.get('track_name')}\n\n{hook}",
+                reply_markup=kb
+            )
 
         await message.answer("✅ Відправлено на модерацію")
         await state.clear()
 
     except Exception as e:
-        logging.error(f"Image step error: {e}")
-        await message.answer("❌ Помилка. Спробуй ще раз.")
+        logging.error(e)
+        await message.answer("❌ Помилка")
 
-# ---------------- AI ----------------
-async def generate_text(data):
+# ---------------- AI HOOK ----------------
+async def generate_hook(data):
     if not OPENAI_API_KEY:
-        return fallback_text(data)
+        return fallback_hook()
 
     try:
         prompt = f"""
-        Напиши короткий маркетинговий опис треку.
+        Напиши 2 рядки у стилі телеграм музичних постів:
+
+        ❤️ — коротко
+        💔 — протилежно
 
         Жанр: {data.get('genre')}
         Настрій: {data.get('mood')}
-
-        Правила:
-        - 2-4 речення
-        - без вигаданих фактів
-        - стиль як у музичних релізів
         """
 
-        response = client.chat.completions.create(
+        res = client.chat.completions.create(
             model="gpt-4.1-mini",
-            messages=[{"role": "user", "content": prompt}],
+            messages=[{"role": "user", "content": prompt}]
         )
 
-        return response.choices[0].message.content.strip()
+        return res.choices[0].message.content.strip()
 
-    except Exception as e:
-        logging.error(f"AI error: {e}")
-        return fallback_text(data)
+    except:
+        return fallback_hook()
 
-def fallback_text(data):
-    return f"{data.get('artist')} презентує трек у жанрі {data.get('genre')} з атмосферою {data.get('mood')}."
+def fallback_hook():
+    variants = [
+        ("❤️ — це качає", "💔 — але не всім зайде"),
+        ("❤️ — норм вайб", "💔 — але сиро"),
+        ("❤️ — є потенціал", "💔 — треба допрацювати"),
+    ]
+    v = random.choice(variants)
+    return f"{v[0]}\n{v[1]}"
 
-# ---------------- ADMIN ----------------
+# ---------------- FEATURE ----------------
+async def get_feature_link(isrc):
+    try:
+        return f"https://feature.fm/{isrc}"
+    except:
+        return None
+
+# ---------------- LINKS ----------------
+def build_links():
+    return (
+        "\n\n"
+        "<a href='https://t.me/Splyt_ch'>splyT</a> | "
+        "<a href='https://t.me/splyt_chat'>Чат</a> | "
+        "<a href='https://discord.gg/pdu4SSFwPN'>discord</a>\n"
+        "👉 <a href='https://t.me/Splyt_ch'><b>ПІДПИСАТИСЯ</b></a>"
+    )
+
+# ---------------- APPROVE ----------------
 @dp.callback_query(F.data.startswith("approve_"))
 async def approve(callback):
     track_id = int(callback.data.split("_")[1])
 
     async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT * FROM tracks WHERE id=?", (track_id,))
+        row = await cursor.fetchone()
+
         await db.execute("UPDATE tracks SET status='approved' WHERE id=?", (track_id,))
         await db.commit()
 
-    await callback.message.edit_caption(callback.message.caption + "\n\n✅ APPROVED")
-    await callback.answer("Approved")
+    artist = row[1]
+    track = row[2]
+    image = row[7]
+    hook = row[8]
 
+    caption = f"🎵 {artist} - {track}\n\n{hook}{build_links()}"
+
+    await bot.send_photo(
+        CHANNEL_ID,
+        photo=image,
+        caption=caption,
+        parse_mode="HTML"
+    )
+
+    await callback.message.edit_caption(callback.message.caption + "\n\n✅ APPROVED")
+    await callback.answer("Posted 🚀")
+
+# ---------------- REJECT ----------------
 @dp.callback_query(F.data.startswith("reject_"))
 async def reject(callback):
     track_id = int(callback.data.split("_")[1])
@@ -226,12 +261,8 @@ async def reject(callback):
 
 # ---------------- MAIN ----------------
 async def main():
-    logging.info("🚀 Bot starting...")
     await init_db()
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except Exception as e:
-        logging.error(f"CRITICAL ERROR: {e}")
+    asyncio.run(main())
