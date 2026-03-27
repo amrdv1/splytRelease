@@ -2,7 +2,6 @@ import asyncio
 import os
 import json
 import logging
-import random
 import aiosqlite
 import aiohttp
 import base64
@@ -93,6 +92,34 @@ async def get_spotify_link_from_isrc(isrc):
 
     return None
 
+async def search_spotify_by_text(artist, track):
+    try:
+        token = await get_spotify_token()
+        query = f"{artist} {track}"
+
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"https://api.spotify.com/v1/search?q={query}&type=track&limit=1",
+                headers={"Authorization": f"Bearer {token}"}
+            ) as resp:
+                data = await resp.json()
+
+                items = data.get("tracks", {}).get("items", [])
+                if items:
+                    item = items[0]
+
+                    return {
+                        "artist": item["artists"][0]["name"],
+                        "track": item["name"],
+                        "image": item["album"]["images"][0]["url"],
+                        "spotify": item["external_urls"]["spotify"]
+                    }
+
+    except Exception as e:
+        logging.error(f"Spotify search error: {e}")
+
+    return None
+
 # ---------------- ODESLI ----------------
 async def create_smart_link(links):
     try:
@@ -112,23 +139,20 @@ async def create_smart_link(links):
 
 async def create_smart_link_from_isrc(isrc):
     spotify_link = await get_spotify_link_from_isrc(isrc)
-
     if spotify_link:
         return await create_smart_link([spotify_link])
-
     return None
 
-# ---------------- YOUTUBE FALLBACK ----------------
+# ---------------- FALLBACK ----------------
 def build_youtube_search_link(artist, track):
     query = f"{artist} {track}"
     return f"https://www.youtube.com/results?search_query={urllib.parse.quote(query)}"
 
-# ---------------- SMART BLOCK ----------------
-def build_smart_block(smart_link):
+def build_smart_block(link):
     return (
         "\n\n"
         "слухати 👇\n"
-        f"<a href=\"{smart_link}\">link</a>"
+        f"<a href=\"{link}\">link</a>"
     )
 
 # ---------------- STATES ----------------
@@ -203,6 +227,18 @@ async def image_step(message: Message, state: FSMContext):
         await state.update_data(image_file_id=photo)
 
         data = await state.get_data()
+
+        # 🔥 Spotify metadata fallback
+        if not data.get("isrc"):
+            spotify_data = await search_spotify_by_text(
+                data.get("artist"),
+                data.get("track_name")
+            )
+
+            if spotify_data:
+                data["artist"] = spotify_data["artist"]
+                data["track_name"] = spotify_data["track"]
+
         text = await generate_full_text(data)
 
         async with aiosqlite.connect(DB_PATH) as db:
@@ -348,6 +384,11 @@ async def post(callback):
             smart_link = await create_smart_link(links)
         elif isrc:
             smart_link = await create_smart_link_from_isrc(isrc)
+
+        if not smart_link:
+            spotify_data = await search_spotify_by_text(artist, track)
+            if spotify_data:
+                smart_link = await create_smart_link([spotify_data["spotify"]])
 
         if not smart_link:
             smart_link = build_youtube_search_link(artist, track)
