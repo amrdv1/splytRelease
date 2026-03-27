@@ -6,6 +6,7 @@ import random
 import aiosqlite
 import aiohttp
 import base64
+import urllib.parse
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
@@ -117,19 +118,18 @@ async def create_smart_link_from_isrc(isrc):
 
     return None
 
+# ---------------- YOUTUBE FALLBACK ----------------
+def build_youtube_search_link(artist, track):
+    query = f"{artist} {track}"
+    return f"https://www.youtube.com/results?search_query={urllib.parse.quote(query)}"
+
+# ---------------- SMART BLOCK ----------------
 def build_smart_block(smart_link):
-    if smart_link:
-        return (
-            "\n\n"
-            "слухати 👇\n"
-            f"<a href='{smart_link}'>link</a>"
-        )
-    else:
-        return (
-            "\n\n"
-            "слухати 👇\n"
-            "link"
-        )
+    return (
+        "\n\n"
+        "слухати 👇\n"
+        f"<a href=\"{smart_link}\">link</a>"
+    )
 
 # ---------------- STATES ----------------
 class Form(StatesGroup):
@@ -203,7 +203,6 @@ async def image_step(message: Message, state: FSMContext):
         await state.update_data(image_file_id=photo)
 
         data = await state.get_data()
-
         text = await generate_full_text(data)
 
         async with aiosqlite.connect(DB_PATH) as db:
@@ -249,7 +248,7 @@ async def image_step(message: Message, state: FSMContext):
 # ---------------- AI ----------------
 async def generate_full_text(data):
     if not OPENAI_API_KEY:
-        return fallback_full()
+        return "Норм трек\n\n❤️ — качає\n💔 — сиро"
 
     try:
         prompt = f"""
@@ -273,10 +272,7 @@ async def generate_full_text(data):
         return res.choices[0].message.content.strip()
 
     except:
-        return fallback_full()
-
-def fallback_full():
-    return "Норм трек\n\n❤️ — качає\n💔 — сиро"
+        return "Норм трек\n\n❤️ — качає\n💔 — сиро"
 
 # ---------------- LINKS ----------------
 def build_links():
@@ -303,12 +299,31 @@ def get_admin_kb(track_id):
 @dp.callback_query(F.data.startswith("approve_"))
 async def approve(callback):
     track_id = int(callback.data.split("_")[1])
-
-    await callback.message.edit_reply_markup(
-        reply_markup=get_admin_kb(track_id)
-    )
-
+    await callback.message.edit_reply_markup(reply_markup=get_admin_kb(track_id))
     await callback.answer("Готово до посту")
+
+# ---------------- EDIT ----------------
+@dp.callback_query(F.data.startswith("edit_"))
+async def edit(callback, state: FSMContext):
+    track_id = int(callback.data.split("_")[1])
+    await state.update_data(edit_id=track_id)
+    await state.set_state(EditState.text)
+    await callback.message.answer("✏️ Введи новий текст:")
+
+@dp.message(StateFilter(EditState.text))
+async def save_edit(message: Message, state: FSMContext):
+    data = await state.get_data()
+    track_id = data.get("edit_id")
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE tracks SET description=? WHERE id=?",
+            (message.text, track_id)
+        )
+        await db.commit()
+
+    await message.answer("✅ Оновлено")
+    await state.clear()
 
 # ---------------- POST ----------------
 @dp.callback_query(F.data.startswith("post_"))
@@ -333,6 +348,9 @@ async def post(callback):
             smart_link = await create_smart_link(links)
         elif isrc:
             smart_link = await create_smart_link_from_isrc(isrc)
+
+        if not smart_link:
+            smart_link = build_youtube_search_link(artist, track)
 
         caption = (
             f"🎵 {artist} - {track}\n\n"
