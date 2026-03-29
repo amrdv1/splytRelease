@@ -39,7 +39,6 @@ async def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             artist TEXT,
             track_name TEXT,
-            isrc TEXT,
             genre TEXT,
             mood TEXT,
             links TEXT,
@@ -55,7 +54,6 @@ async def init_db():
 class Form(StatesGroup):
     artist = State()
     track_name = State()
-    isrc = State()
     genre = State()
     mood = State()
     links = State()
@@ -72,24 +70,12 @@ async def start(message: Message, state: FSMContext):
 @dp.message(Form.artist)
 async def artist_step(message: Message, state: FSMContext):
     await state.update_data(artist=message.text.strip())
-    await message.answer("Назва треку (або -):")
+    await message.answer("Назва треку:")
     await state.set_state(Form.track_name)
 
 @dp.message(Form.track_name)
 async def track_step(message: Message, state: FSMContext):
     await state.update_data(track_name=message.text.strip())
-    await message.answer("ISRC (або -):")
-    await state.set_state(Form.isrc)
-
-@dp.message(Form.isrc)
-async def isrc_step(message: Message, state: FSMContext):
-    data = await state.get_data()
-
-    if message.text.strip() == "-" and data.get("track_name") == "-":
-        await message.answer("❌ Потрібен ISRC або назва")
-        return
-
-    await state.update_data(isrc=None if message.text == "-" else message.text.strip())
     await message.answer("Жанр:")
     await state.set_state(Form.genre)
 
@@ -130,12 +116,11 @@ async def handle_media(message, state, media_type, file_id):
 
         async with aiosqlite.connect(DB_PATH) as db:
             cursor = await db.execute("""
-            INSERT INTO tracks (artist, track_name, isrc, genre, mood, links, file_id, file_type, description, status)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO tracks (artist, track_name, genre, mood, links, file_id, file_type, description, status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 data.get("artist"),
                 data.get("track_name"),
-                data.get("isrc"),
                 data.get("genre"),
                 data.get("mood"),
                 data.get("links"),
@@ -174,7 +159,7 @@ async def handle_media(message, state, media_type, file_id):
 # ---------------- AI ----------------
 async def generate_full_text(data):
     if not OPENAI_API_KEY:
-        return fallback_full()
+        return "Норм трек\n\n❤️ — качає\n💔 — сиро"
 
     try:
         prompt = f"""
@@ -199,10 +184,7 @@ async def generate_full_text(data):
         return res.choices[0].message.content.strip()
 
     except:
-        return fallback_full()
-
-def fallback_full():
-    return "Норм трек\n\n❤️ — качає\n💔 — сиро"
+        return "Норм трек\n\n❤️ — качає\n💔 — сиро"
 
 # ---------------- LINKS ----------------
 def build_links():
