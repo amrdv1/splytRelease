@@ -2,7 +2,6 @@ import asyncio
 import os
 import json
 import logging
-import random
 import aiosqlite
 
 from aiogram import Bot, Dispatcher, F
@@ -10,6 +9,7 @@ from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.filters import StateFilter
 
 from openai import OpenAI
 
@@ -58,6 +58,9 @@ class Form(StatesGroup):
     mood = State()
     links = State()
     media = State()
+
+class EditState(StatesGroup):
+    text = State()
 
 # ---------------- START ----------------
 @dp.message(F.text == "/start")
@@ -134,20 +137,29 @@ async def handle_media(message, state, media_type, file_id):
 
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [
-                InlineKeyboardButton(text="✅ Approve", callback_data=f"approve_{track_id}"),
+                InlineKeyboardButton(text="✏️ Edit", callback_data=f"edit_{track_id}"),
+                InlineKeyboardButton(text="🚀 Post", callback_data=f"post_{track_id}")
+            ],
+            [
                 InlineKeyboardButton(text="❌ Reject", callback_data=f"reject_{track_id}")
             ]
         ])
 
         for admin in ADMIN_IDS:
             if media_type == "photo":
-                await bot.send_photo(admin, photo=file_id,
+                await bot.send_photo(
+                    admin,
+                    photo=file_id,
                     caption=f"🎵 {data.get('artist')} - {data.get('track_name')}\n\n{text}",
-                    reply_markup=kb)
+                    reply_markup=kb
+                )
             else:
-                await bot.send_video(admin, video=file_id,
+                await bot.send_video(
+                    admin,
+                    video=file_id,
                     caption=f"🎵 {data.get('artist')} - {data.get('track_name')}\n\n{text}",
-                    reply_markup=kb)
+                    reply_markup=kb
+                )
 
         await message.answer("✅ Відправлено на модерацію")
         await state.clear()
@@ -159,7 +171,7 @@ async def handle_media(message, state, media_type, file_id):
 # ---------------- AI ----------------
 async def generate_full_text(data):
     if not OPENAI_API_KEY:
-        return "Норм трек\n\n❤️ — качає\n💔 — сиро"
+        return fallback_full()
 
     try:
         prompt = f"""
@@ -184,7 +196,10 @@ async def generate_full_text(data):
         return res.choices[0].message.content.strip()
 
     except:
-        return "Норм трек\n\n❤️ — качає\n💔 — сиро"
+        return fallback_full()
+
+def fallback_full():
+    return "Норм трек\n\n❤️ — качає\n💔 — сиро"
 
 # ---------------- LINKS ----------------
 def build_links():
@@ -196,9 +211,32 @@ def build_links():
         "👉 <a href='https://t.me/Splyt_ch'><b>ПІДПИСАТИСЯ</b></a>"
     )
 
-# ---------------- APPROVE ----------------
-@dp.callback_query(F.data.startswith("approve_"))
-async def approve(callback):
+# ---------------- EDIT ----------------
+@dp.callback_query(F.data.startswith("edit_"))
+async def edit(callback, state: FSMContext):
+    track_id = int(callback.data.split("_")[1])
+    await state.update_data(edit_id=track_id)
+    await state.set_state(EditState.text)
+    await callback.message.answer("✏️ Введи новий текст:")
+
+@dp.message(StateFilter(EditState.text))
+async def save_edit(message: Message, state: FSMContext):
+    data = await state.get_data()
+    track_id = data.get("edit_id")
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE tracks SET description=? WHERE id=?",
+            (message.text, track_id)
+        )
+        await db.commit()
+
+    await message.answer("✅ Оновлено")
+    await state.clear()
+
+# ---------------- POST ----------------
+@dp.callback_query(F.data.startswith("post_"))
+async def post(callback):
     track_id = int(callback.data.split("_")[1])
 
     async with aiosqlite.connect(DB_PATH) as db:
