@@ -2,37 +2,27 @@ import asyncio
 import os
 import json
 import logging
+import random
 import aiosqlite
-import aiohttp
-import base64
-import urllib.parse
-import re
-
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.filters import StateFilter
-
 from openai import OpenAI
 
-# ---------------- LOGS ----------------
+# ---------------- LOGGING ----------------
 logging.basicConfig(level=logging.INFO)
 
 # ---------------- ENV ----------------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x]
-
+CHANNEL_ID = int(os.getenv("CHANNEL_ID"))
 CHANNEL_ID = os.getenv("CHANNEL_ID")
 if CHANNEL_ID:
     CHANNEL_ID = int(CHANNEL_ID)
 
-SPOTIFY_CLIENT_ID = os.getenv("SPOTIFY_CLIENT_ID")
-SPOTIFY_CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET")
-
-# ---------------- INIT ----------------
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 client = OpenAI(api_key=OPENAI_API_KEY)
@@ -58,98 +48,6 @@ async def init_db():
         """)
         await db.commit()
 
-# ---------------- HELPERS ----------------
-def clean_text(text):
-    return re.sub(r"[^\w\s]", "", text)
-
-def build_youtube_search_link(artist, track):
-    query = f"{artist} {track}"
-    return f"https://www.youtube.com/results?search_query={urllib.parse.quote(query)}"
-
-def build_smart_block(link):
-    return (
-        "\n\n"
-        "слухати 👇\n"
-        f"<a href=\"{link}\">link</a>"
-    )
-
-# ---------------- SPOTIFY ----------------
-async def get_spotify_token():
-    auth = base64.b64encode(
-        f"{SPOTIFY_CLIENT_ID}:{SPOTIFY_CLIENT_SECRET}".encode()
-    ).decode()
-
-    async with aiohttp.ClientSession() as session:
-        async with session.post(
-            "https://accounts.spotify.com/api/token",
-            headers={"Authorization": f"Basic {auth}"},
-            data={"grant_type": "client_credentials"},
-        ) as resp:
-            data = await resp.json()
-            return data.get("access_token")
-
-async def get_spotify_link_from_isrc(isrc):
-    try:
-        token = await get_spotify_token()
-
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                f"https://api.spotify.com/v1/search?q=isrc:{isrc}&type=track",
-                headers={"Authorization": f"Bearer {token}"}
-            ) as resp:
-                data = await resp.json()
-
-                items = data.get("tracks", {}).get("items", [])
-                if items:
-                    return items[0]["external_urls"]["spotify"]
-
-    except Exception as e:
-        logging.error(f"ISRC Spotify error: {e}")
-
-    return None
-
-async def search_spotify_by_text(artist, track):
-    try:
-        token = await get_spotify_token()
-
-        artist_clean = clean_text(artist)
-        track_clean = clean_text(track)
-
-        query = f"track:{track_clean} artist:{artist_clean}"
-
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                f"https://api.spotify.com/v1/search?q={query}&type=track&limit=1",
-                headers={"Authorization": f"Bearer {token}"}
-            ) as resp:
-                data = await resp.json()
-
-                items = data.get("tracks", {}).get("items", [])
-                print("SPOTIFY SEARCH:", items)
-
-                if items:
-                    return items[0]["external_urls"]["spotify"]
-
-    except Exception as e:
-        logging.error(f"Spotify search error: {e}")
-
-    return None
-
-# ---------------- ODESLI ----------------
-async def create_smart_link(link):
-    try:
-        url = f"https://api.song.link/v1-alpha.1/links?url={link}"
-
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url) as resp:
-                data = await resp.json()
-                return data.get("pageUrl")
-
-    except Exception as e:
-        logging.error(f"Odesli error: {e}")
-
-    return None
-
 # ---------------- STATES ----------------
 class Form(StatesGroup):
     artist = State()
@@ -159,9 +57,6 @@ class Form(StatesGroup):
     mood = State()
     links = State()
     image = State()
-
-class EditState(StatesGroup):
-    text = State()
 
 # ---------------- START ----------------
 @dp.message(F.text == "/start")
@@ -214,7 +109,6 @@ async def links_step(message: Message, state: FSMContext):
     await message.answer("Завантаж обкладинку:")
     await state.set_state(Form.image)
 
-# ---------------- IMAGE ----------------
 @dp.message(Form.image, F.photo)
 async def image_step(message: Message, state: FSMContext):
     try:
@@ -222,8 +116,19 @@ async def image_step(message: Message, state: FSMContext):
         await state.update_data(image_file_id=photo)
 
         data = await state.get_data()
-        text = await generate_full_text(data)
 
+        # ---------- LINKS ----------
+        links = json.loads(data.get("links"))
+
+        if not links and data.get("isrc"):
+            smart = await get_feature_link(data.get("isrc"))
+            if smart:
+                links = [smart]
+
+        # ---------- AI ----------
+        hook = await generate_hook(data)
+
+        # ---------- SAVE ----------
         async with aiosqlite.connect(DB_PATH) as db:
             cursor = await db.execute("""
             INSERT INTO tracks (artist, track_name, isrc, genre, mood, links, image_file_id, description, status)
@@ -234,9 +139,9 @@ async def image_step(message: Message, state: FSMContext):
                 data.get("isrc"),
                 data.get("genre"),
                 data.get("mood"),
-                data.get("links"),
+                json.dumps(links),
                 photo,
-                text,
+                hook,
                 "pending"
             ))
             await db.commit()
@@ -253,7 +158,7 @@ async def image_step(message: Message, state: FSMContext):
             await bot.send_photo(
                 admin,
                 photo=photo,
-                caption=f"🎵 {data.get('artist')} - {data.get('track_name')}\n\n{text}",
+                caption=f"🎵 {data.get('artist')} - {data.get('track_name')}\n\n{hook}",
                 reply_markup=kb
             )
 
@@ -264,21 +169,16 @@ async def image_step(message: Message, state: FSMContext):
         logging.error(e)
         await message.answer("❌ Помилка")
 
-# ---------------- AI ----------------
-async def generate_full_text(data):
+# ---------------- AI HOOK ----------------
+async def generate_hook(data):
     if not OPENAI_API_KEY:
-        return "Норм трек\n\n❤️ — качає\n💔 — сиро"
+        return fallback_hook()
 
     try:
         prompt = f"""
-        Напиши пост для телеграм музичного каналу.
-
-        Формат:
-        короткий опис + 2 рядки:
-
-        ❤️ — ...
-        💔 — ...
-
+        Напиши 2 рядки у стилі телеграм музичних постів:
+        ❤️ — коротко
+        💔 — протилежно
         Жанр: {data.get('genre')}
         Настрій: {data.get('mood')}
         """
@@ -291,102 +191,74 @@ async def generate_full_text(data):
         return res.choices[0].message.content.strip()
 
     except:
-        return "Норм трек\n\n❤️ — качає\n💔 — сиро"
+        return fallback_hook()
+
+def fallback_hook():
+    variants = [
+        ("❤️ — це качає", "💔 — але не всім зайде"),
+        ("❤️ — норм вайб", "💔 — але сиро"),
+        ("❤️ — є потенціал", "💔 — треба допрацювати"),
+    ]
+    v = random.choice(variants)
+    return f"{v[0]}\n{v[1]}"
+
+# ---------------- FEATURE ----------------
+async def get_feature_link(isrc):
+    try:
+        return f"https://feature.fm/{isrc}"
+    except:
+        return None
+
+# ---------------- LINKS ----------------
+def build_links():
+    return (
+        "\n\n"
+        "<a href='https://t.me/Splyt_ch'>splyT</a> | "
+        "<a href='https://t.me/splyt_chat'>Чат</a> | "
+        "<a href='https://discord.gg/pdu4SSFwPN'>discord</a>\n"
+        "👉 <a href='https://t.me/Splyt_ch'><b>ПІДПИСАТИСЯ</b></a>"
+    )
 
 # ---------------- APPROVE ----------------
-def get_admin_kb(track_id):
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="✏️ Edit", callback_data=f"edit_{track_id}"),
-            InlineKeyboardButton(text="🚀 Post", callback_data=f"post_{track_id}")
-        ],
-        [
-            InlineKeyboardButton(text="❌ Reject", callback_data=f"reject_{track_id}")
-        ]
-    ])
-
 @dp.callback_query(F.data.startswith("approve_"))
 async def approve(callback):
     track_id = int(callback.data.split("_")[1])
-    await callback.message.edit_reply_markup(reply_markup=get_admin_kb(track_id))
-    await callback.answer("Готово до посту")
-
-# ---------------- EDIT ----------------
-@dp.callback_query(F.data.startswith("edit_"))
-async def edit(callback, state: FSMContext):
-    track_id = int(callback.data.split("_")[1])
-    await state.update_data(edit_id=track_id)
-    await state.set_state(EditState.text)
-    await callback.message.answer("✏️ Введи новий текст:")
-
-@dp.message(StateFilter(EditState.text))
-async def save_edit(message: Message, state: FSMContext):
-    data = await state.get_data()
-    track_id = data.get("edit_id")
 
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "UPDATE tracks SET description=? WHERE id=?",
-            (message.text, track_id)
-        )
+        cursor = await db.execute("SELECT * FROM tracks WHERE id=?", (track_id,))
+        row = await cursor.fetchone()
+
+        await db.execute("UPDATE tracks SET status='approved' WHERE id=?", (track_id,))
         await db.commit()
 
-    await message.answer("✅ Оновлено")
-    await state.clear()
+    artist = row[1]
+    track = row[2]
+    image = row[7]
+    hook = row[8]
 
-# ---------------- POST ----------------
-@dp.callback_query(F.data.startswith("post_"))
-async def post(callback):
-    try:
-        track_id = int(callback.data.split("_")[1])
+    caption = f"🎵 {artist} - {track}\n\n{hook}{build_links()}"
 
-        async with aiosqlite.connect(DB_PATH) as db:
-            cursor = await db.execute("SELECT * FROM tracks WHERE id=?", (track_id,))
-            row = await cursor.fetchone()
+    await bot.send_photo(
+        CHANNEL_ID,
+        photo=image,
+        caption=caption,
+        parse_mode="HTML"
+    )
 
-        artist = row[1]
-        track = row[2]
-        image = row[7]
-        text = row[8]
-        links = json.loads(row[6])
-        isrc = row[3]
+    await callback.message.edit_caption(callback.message.caption + "\n\n✅ APPROVED")
+    await callback.answer("Posted 🚀")
 
-        smart_link = None
+# ---------------- REJECT ----------------
+@dp.callback_query(F.data.startswith("reject_"))
+async def reject(callback):
+    track_id = int(callback.data.split("_")[1])
 
-        if links:
-            smart_link = await create_smart_link(links[0])
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE tracks SET status='rejected' WHERE id=?", (track_id,))
+        await db.commit()
 
-        elif isrc:
-            spotify = await get_spotify_link_from_isrc(isrc)
-            if spotify:
-                smart_link = await create_smart_link(spotify)
-
-        if not smart_link:
-            spotify = await search_spotify_by_text(artist, track)
-            if spotify:
-                smart_link = await create_smart_link(spotify)
-
-        if not smart_link:
-            smart_link = build_youtube_search_link(artist, track)
-
-        caption = (
-            f"🎵 {artist} - {track}\n\n"
-            f"{text}"
-            f"{build_smart_block(smart_link)}"
-        )
-
-        await bot.send_photo(
-            CHANNEL_ID,
-            photo=image,
-            caption=caption,
-            parse_mode="HTML"
-        )
-
-        await callback.answer("🚀 Запощено")
-
-    except Exception as e:
-        logging.error(e)
-        await callback.answer("❌ Помилка поста")
+    await callback.message.edit_caption(callback.message.caption + "\n\n❌ REJECTED")
+    await callback.answer("Rejected")
 
 # ---------------- MAIN ----------------
 async def main():
