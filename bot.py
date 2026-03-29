@@ -4,11 +4,13 @@ import json
 import logging
 import random
 import aiosqlite
+
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.storage.memory import MemoryStorage
+
 from openai import OpenAI
 
 # ---------------- LOGGING ----------------
@@ -18,7 +20,7 @@ logging.basicConfig(level=logging.INFO)
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x]
-CHANNEL_ID = int(os.getenv("CHANNEL_ID"))
+
 CHANNEL_ID = os.getenv("CHANNEL_ID")
 if CHANNEL_ID:
     CHANNEL_ID = int(CHANNEL_ID)
@@ -41,7 +43,8 @@ async def init_db():
             genre TEXT,
             mood TEXT,
             links TEXT,
-            image_file_id TEXT,
+            file_id TEXT,
+            file_type TEXT,
             description TEXT,
             status TEXT
         )
@@ -56,7 +59,7 @@ class Form(StatesGroup):
     genre = State()
     mood = State()
     links = State()
-    image = State()
+    media = State()
 
 # ---------------- START ----------------
 @dp.message(F.text == "/start")
@@ -106,42 +109,39 @@ async def mood_step(message: Message, state: FSMContext):
 async def links_step(message: Message, state: FSMContext):
     links = [] if message.text.strip() == "-" else [message.text.strip()]
     await state.update_data(links=json.dumps(links))
-    await message.answer("Завантаж обкладинку:")
-    await state.set_state(Form.image)
+    await message.answer("Завантаж фото або відео:")
+    await state.set_state(Form.media)
 
-@dp.message(Form.image, F.photo)
-async def image_step(message: Message, state: FSMContext):
+# ---------------- MEDIA ----------------
+@dp.message(Form.media, F.photo)
+async def photo_step(message: Message, state: FSMContext):
+    await handle_media(message, state, "photo", message.photo[-1].file_id)
+
+@dp.message(Form.media, F.video)
+async def video_step(message: Message, state: FSMContext):
+    await handle_media(message, state, "video", message.video.file_id)
+
+async def handle_media(message, state, media_type, file_id):
     try:
-        photo = message.photo[-1].file_id
-        await state.update_data(image_file_id=photo)
-
+        await state.update_data(file_id=file_id, file_type=media_type)
         data = await state.get_data()
 
-        # ---------- LINKS ----------
-        links = json.loads(data.get("links"))
+        text = await generate_full_text(data)
 
-        if not links and data.get("isrc"):
-            smart = await get_feature_link(data.get("isrc"))
-            if smart:
-                links = [smart]
-
-        # ---------- AI ----------
-        hook = await generate_hook(data)
-
-        # ---------- SAVE ----------
         async with aiosqlite.connect(DB_PATH) as db:
             cursor = await db.execute("""
-            INSERT INTO tracks (artist, track_name, isrc, genre, mood, links, image_file_id, description, status)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO tracks (artist, track_name, isrc, genre, mood, links, file_id, file_type, description, status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 data.get("artist"),
                 data.get("track_name"),
                 data.get("isrc"),
                 data.get("genre"),
                 data.get("mood"),
-                json.dumps(links),
-                photo,
-                hook,
+                data.get("links"),
+                file_id,
+                media_type,
+                text,
                 "pending"
             ))
             await db.commit()
@@ -155,12 +155,14 @@ async def image_step(message: Message, state: FSMContext):
         ])
 
         for admin in ADMIN_IDS:
-            await bot.send_photo(
-                admin,
-                photo=photo,
-                caption=f"🎵 {data.get('artist')} - {data.get('track_name')}\n\n{hook}",
-                reply_markup=kb
-            )
+            if media_type == "photo":
+                await bot.send_photo(admin, photo=file_id,
+                    caption=f"🎵 {data.get('artist')} - {data.get('track_name')}\n\n{text}",
+                    reply_markup=kb)
+            else:
+                await bot.send_video(admin, video=file_id,
+                    caption=f"🎵 {data.get('artist')} - {data.get('track_name')}\n\n{text}",
+                    reply_markup=kb)
 
         await message.answer("✅ Відправлено на модерацію")
         await state.clear()
@@ -169,16 +171,22 @@ async def image_step(message: Message, state: FSMContext):
         logging.error(e)
         await message.answer("❌ Помилка")
 
-# ---------------- AI HOOK ----------------
-async def generate_hook(data):
+# ---------------- AI ----------------
+async def generate_full_text(data):
     if not OPENAI_API_KEY:
-        return fallback_hook()
+        return fallback_full()
 
     try:
         prompt = f"""
-        Напиши 2 рядки у стилі телеграм музичних постів:
-        ❤️ — коротко
-        💔 — протилежно
+        Напиши пост для телеграм музичного каналу.
+
+        Формат:
+        1 абзац (2-3 речення)
+        потім:
+
+        ❤️ — ...
+        💔 — ...
+
         Жанр: {data.get('genre')}
         Настрій: {data.get('mood')}
         """
@@ -191,23 +199,10 @@ async def generate_hook(data):
         return res.choices[0].message.content.strip()
 
     except:
-        return fallback_hook()
+        return fallback_full()
 
-def fallback_hook():
-    variants = [
-        ("❤️ — це качає", "💔 — але не всім зайде"),
-        ("❤️ — норм вайб", "💔 — але сиро"),
-        ("❤️ — є потенціал", "💔 — треба допрацювати"),
-    ]
-    v = random.choice(variants)
-    return f"{v[0]}\n{v[1]}"
-
-# ---------------- FEATURE ----------------
-async def get_feature_link(isrc):
-    try:
-        return f"https://feature.fm/{isrc}"
-    except:
-        return None
+def fallback_full():
+    return "Норм трек\n\n❤️ — качає\n💔 — сиро"
 
 # ---------------- LINKS ----------------
 def build_links():
@@ -228,37 +223,23 @@ async def approve(callback):
         cursor = await db.execute("SELECT * FROM tracks WHERE id=?", (track_id,))
         row = await cursor.fetchone()
 
-        await db.execute("UPDATE tracks SET status='approved' WHERE id=?", (track_id,))
-        await db.commit()
+    artist, track = row[1], row[2]
+    file_id, file_type = row[6], row[7]
+    text = row[8]
 
-    artist = row[1]
-    track = row[2]
-    image = row[7]
-    hook = row[8]
+    caption = f"🎵 {artist} - {track}\n\n{text}{build_links()}"
 
-    caption = f"🎵 {artist} - {track}\n\n{hook}{build_links()}"
+    if file_type == "photo":
+        await bot.send_photo(CHANNEL_ID, photo=file_id, caption=caption, parse_mode="HTML")
+    else:
+        await bot.send_video(CHANNEL_ID, video=file_id, caption=caption, parse_mode="HTML")
 
-    await bot.send_photo(
-        CHANNEL_ID,
-        photo=image,
-        caption=caption,
-        parse_mode="HTML"
-    )
-
-    await callback.message.edit_caption(callback.message.caption + "\n\n✅ APPROVED")
-    await callback.answer("Posted 🚀")
+    await callback.answer("🚀 Запощено")
 
 # ---------------- REJECT ----------------
 @dp.callback_query(F.data.startswith("reject_"))
 async def reject(callback):
-    track_id = int(callback.data.split("_")[1])
-
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("UPDATE tracks SET status='rejected' WHERE id=?", (track_id,))
-        await db.commit()
-
-    await callback.message.edit_caption(callback.message.caption + "\n\n❌ REJECTED")
-    await callback.answer("Rejected")
+    await callback.answer("❌ Відхилено")
 
 # ---------------- MAIN ----------------
 async def main():
